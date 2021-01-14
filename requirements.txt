@@ -1,0 +1,7 @@
+typer
+python-gitlab
+rich
+maya
+attrs
+cattrs
+diskcache
