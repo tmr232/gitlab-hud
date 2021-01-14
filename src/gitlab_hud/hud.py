@@ -6,7 +6,8 @@ import shutil
 from itertools import count, islice
 from operator import attrgetter
 from pathlib import Path
-from typing import List, Optional, TypeVar, Callable, Union
+from pprint import pprint
+from typing import List, Optional, TypeVar, Callable, Union, Iterator
 
 import attr
 import cattr
@@ -14,6 +15,7 @@ import gitlab
 import maya
 import typer as typer
 from diskcache import Index
+from gitlab.v4.objects import Project
 from rich.console import Console
 from rich.table import Table
 
@@ -42,6 +44,7 @@ CONFIG_PATH = DATA_ROOT / "config.json"
 CACHE_ROOT = DATA_ROOT / "cache"
 CONTROL_CACHE = str(CACHE_ROOT / "control")
 MR_CACHE = str(CACHE_ROOT / "mrs")
+PIPELINE_CACHE = str(CACHE_ROOT / "pipelines")
 
 
 def my_username():
@@ -89,19 +92,33 @@ class Pipeline:
     status: str
     updated_at: maya.MayaDT = attr.ib(repr=maya.MayaDT.slang_time)
     link: str
+    sha: str
+    ref: str
 
     @staticmethod
-    def from_gitlab(pipeline) -> Pipeline:
+    def from_gitlab_dict(pipeline) -> Pipeline:
         id_ = pipeline["id"]
         status = pipeline["status"]
         updated_at = maya.MayaDT.from_iso8601(pipeline["updated_at"])
         link = pipeline["web_url"]
+        sha = pipeline["sha"]
+        ref = pipeline["ref"]
 
         return Pipeline(
-            id=id_,
-            status=status,
-            updated_at=updated_at,
-            link=link,
+            id=id_, status=status, updated_at=updated_at, link=link, sha=sha, ref=ref
+        )
+
+    @staticmethod
+    def from_gitlab(pipeline) -> Pipeline:
+        id_ = pipeline.id
+        status = pipeline.status
+        updated_at = maya.MayaDT.from_iso8601(pipeline.updated_at)
+        link = pipeline.web_url
+        sha = pipeline.sha
+        ref = pipeline.ref
+
+        return Pipeline(
+            id=id_, status=status, updated_at=updated_at, link=link, sha=sha, ref=ref
         )
 
 
@@ -196,7 +213,7 @@ class MergeRequest:
         approvals = Approvals.from_gitlab(merge_request.approvals.get())
         id_ = merge_request.id
         is_draft = merge_request.work_in_progress
-        pipelines = list(map(Pipeline.from_gitlab, merge_request.pipelines()))
+        pipelines = list(map(Pipeline.from_gitlab_dict, merge_request.pipelines()))
         has_conflicts = merge_request.has_conflicts
 
         return MergeRequest(
@@ -253,6 +270,12 @@ def is_important(merge_request: MergeRequest):
     return False
 
 
+def fetch_pipelines(project):
+    pm = PipelineManager(project, PIPELINE_CACHE)
+    pm.fetch()
+    pprint(list(map(Pipeline.from_gitlab, project.pipelines.list())))
+
+
 def fetch_merge_requests(project):
     for page in count(start=1):
         for merge_request in project.mergerequests.list(
@@ -263,6 +286,50 @@ def fetch_merge_requests(project):
             target_branch="master",
         ):
             yield merge_request
+
+
+class PipelineManager:
+    def __init__(self, project, cache_path: str):
+        self._project = project
+        self._cache_path = cache_path
+        self._cache = Index(cache_path)
+
+    @property
+    def _updated_at(self):
+        return maya.MayaDT.from_iso8601(
+            self._cache.get("updated_at", maya.MayaDT(0).iso8601())
+        )
+
+    @_updated_at.setter
+    def _updated_at(self, value: maya.MayaDT):
+        self._cache["updated_at"] = value.iso8601()
+
+    def _fetch(self, updated_after: Optional[maya.MayaDT] = None) -> Iterator[Pipeline]:
+
+        if updated_after is None:
+            updated_after = self._updated_at
+        for page in count(start=1):
+            for pipeline in self._project.pipelines(
+                page=page,
+                per_page=20,
+                order_by="updated_at",
+                updated_after=updated_after,
+            ):
+                yield Pipeline.from_gitlab(pipeline)
+
+    def fetch(self, limit=100, updated_after: Optional[maya.MayaDT] = None):
+        converter = get_converter()
+        for pipeline in islice(self._fetch(updated_after=updated_after), limit):
+            self._cache[pipeline.id] = json.dumps(converter.unstructure(pipeline))
+            self._updated_at = max(self._updated_at, pipeline.updated_at)
+
+            yield pipeline
+
+        for raw in self._cache.values():
+            dict_ = json.loads(raw)
+            pipeline = converter.structure(dict_, Pipeline)
+            if pipeline.updated_at <= self._updated_at:
+                yield pipeline
 
 
 def load_merge_requests(project):
@@ -341,6 +408,10 @@ def display_hud(include_drafts):
     gl.auth()
 
     project = gl.projects.get(project_id())
+
+    fetch_pipelines(project)
+    return
+
     mr_table = Table(
         "Author",
         "Title",
@@ -383,6 +454,11 @@ def _setup_config():
     typer.edit(filename=CONFIG_PATH)
 
 
+def load_config():
+    global g_config
+    g_config = Config.load(CONFIG_PATH)
+
+
 def main(
     include_drafts: bool = typer.Option(
         default=False,
@@ -405,8 +481,7 @@ def main(
         _clear_cache()
         return
 
-    global g_config
-    g_config = Config.load(CONFIG_PATH)
+    load_config()
 
     display_hud(include_drafts)
 
