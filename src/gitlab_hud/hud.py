@@ -259,7 +259,6 @@ def fetch_merge_requests(project):
             page=page,
             per_page=10,
             order_by="updated_at",
-            state="opened",
             target_branch="master",
         ):
             yield merge_request
